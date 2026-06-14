@@ -1602,10 +1602,8 @@ export class InteractiveMode {
 				switchSession: async (sessionPath, options) => {
 					return this.handleResumeSession(sessionPath, options);
 				},
-				reload: async () => {
-					await this.handleReloadCommand();
-				},
 			},
+			reloadHandler: (reloadCore) => this.performReload(reloadCore),
 			shutdownHandler: () => {
 				this.shutdownRequested = true;
 				if (!this.session.isStreaming) {
@@ -1718,6 +1716,7 @@ export class InteractiveMode {
 					}
 				})();
 			},
+			reload: () => this.session.requestReload(),
 			getSystemPrompt: () => this.session.systemPrompt,
 		});
 
@@ -5058,16 +5057,7 @@ export class InteractiveMode {
 	// Command handlers
 	// =========================================================================
 
-	private async handleReloadCommand(): Promise<void> {
-		if (this.session.isStreaming) {
-			this.showWarning("Wait for the current response to finish before reloading.");
-			return;
-		}
-		if (this.session.isCompacting) {
-			this.showWarning("Wait for compaction to finish before reloading.");
-			return;
-		}
-
+	private async performReload(reloadCore: () => Promise<void>): Promise<void> {
 		this.resetExtensionUI();
 
 		const reloadBox = new Container();
@@ -5095,7 +5085,8 @@ export class InteractiveMode {
 		};
 
 		try {
-			await this.session.reload();
+			let themeWarning: string | undefined;
+			await reloadCore();
 			configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
@@ -5107,7 +5098,7 @@ export class InteractiveMode {
 			const themeName = this.settingsManager.getTheme();
 			const themeResult = themeName ? setTheme(themeName, true) : { success: true };
 			if (!themeResult.success) {
-				this.showError(`Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`);
+				themeWarning = `Failed to load theme "${themeName}": ${themeResult.error}\nFell back to dark theme.`;
 			}
 			const editorPaddingX = this.settingsManager.getEditorPaddingX();
 			const autocompleteMaxVisible = this.settingsManager.getAutocompleteMaxVisible();
@@ -5124,6 +5115,9 @@ export class InteractiveMode {
 			this.setupExtensionShortcuts(runner);
 			this.rebuildChatFromMessages();
 			dismissReloadBox(this.editor as Component);
+			if (themeWarning) {
+				this.showWarning(themeWarning);
+			}
 			this.showLoadedResources({
 				force: false,
 				showDiagnosticsWhenQuiet: true,
@@ -5140,6 +5134,23 @@ export class InteractiveMode {
 			);
 		} catch (error) {
 			dismissReloadBox(previousEditor as Component);
+			throw error;
+		}
+	}
+
+	private async handleReloadCommand(): Promise<void> {
+		if (this.session.isStreaming) {
+			this.showWarning("Wait for the current response to finish before reloading.");
+			return;
+		}
+		if (this.session.isCompacting) {
+			this.showWarning("Wait for compaction to finish before reloading.");
+			return;
+		}
+
+		try {
+			await this.session.reload();
+		} catch (error) {
 			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
@@ -5633,10 +5644,8 @@ export class InteractiveMode {
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
-		const extensionRunner = this.session.extensionRunner;
-
 		// Emit user_bash event to let extensions intercept
-		const eventResult = await extensionRunner.emitUserBash({
+		const eventResult = await this.session.emitUserBash({
 			type: "user_bash",
 			command,
 			excludeFromContext,

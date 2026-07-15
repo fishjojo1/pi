@@ -23,6 +23,7 @@ function createSession(options: {
 	usage?: AssistantUsage;
 	branchUsage?: AssistantUsage;
 	compactionUsage?: AssistantUsage;
+	toolUsage?: AssistantUsage;
 }): AgentSession {
 	const usage = options.usage;
 	const entries: Array<Record<string, unknown>> = [];
@@ -48,6 +49,16 @@ function createSession(options: {
 		entries.push({
 			type: "compaction",
 			usage: options.compactionUsage,
+		});
+	}
+
+	if (options.toolUsage !== undefined) {
+		entries.push({
+			type: "message",
+			message: {
+				role: "toolResult",
+				usage: options.toolUsage,
+			},
 		});
 	}
 
@@ -140,7 +151,7 @@ describe("FooterComponent width handling", () => {
 		}
 	});
 
-	it("includes branch summary usage in the total cost", () => {
+	it("includes summary and tool result usage in the total cost", () => {
 		const session = createSession({
 			sessionName: "",
 			usage: {
@@ -164,11 +175,18 @@ describe("FooterComponent width handling", () => {
 				cacheWrite: 0,
 				cost: { total: 0.125 },
 			},
+			toolUsage: {
+				input: 15,
+				output: 3,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: { total: 0.375 },
+			},
 		});
 		const footer = new FooterComponent(session, createFooterData(1));
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
-		expect(statsLine).toContain("$0.875");
+		expect(statsLine).toContain("$1.250");
 	});
 
 	it("shows the latest cache hit rate when cache usage is present", () => {

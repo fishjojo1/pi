@@ -89,6 +89,208 @@ export interface ConvertResponsesToolsOptions {
 
 type OpenAIFunctionTool = Extract<OpenAITool, { type: "function" }>;
 
+const OPENAI_RESPONSES_COMPACTION_INVALID = "openai_responses_compaction_invalid";
+const OPENAI_RESPONSES_COMPACTION_OVERSIZED = "openai_responses_compaction_oversized";
+const MAX_OPENAI_RESPONSES_COMPACTION_ITEM_BYTES = 16 * 1024 * 1024;
+const MAX_OPENAI_RESPONSES_RETAINED_WINDOW_BYTES = 32 * 1024 * 1024;
+
+interface RetainedResponsesItem {
+	outputIndex: number;
+	item: ResponseOutputItem;
+	bytes: number;
+	type: string;
+	id?: string;
+	callId?: string;
+	name?: string;
+}
+
+interface RetainedResponsesTurn {
+	provider: string;
+	api: "openai-responses";
+	model: string;
+	items: RetainedResponsesItem[];
+}
+
+const retainedResponsesTurns = new WeakMap<AssistantMessage, RetainedResponsesTurn>();
+
+function failCompactionInvalid(): never {
+	throw new Error(OPENAI_RESPONSES_COMPACTION_INVALID);
+}
+
+function failCompactionOversized(): never {
+	throw new Error(OPENAI_RESPONSES_COMPACTION_OVERSIZED);
+}
+
+function jsonByteLength(value: unknown): number {
+	try {
+		const serialized = JSON.stringify(value);
+		if (serialized === undefined) failCompactionInvalid();
+		return new TextEncoder().encode(serialized).byteLength;
+	} catch (error) {
+		if (error instanceof Error && error.message === OPENAI_RESPONSES_COMPACTION_INVALID) throw error;
+		failCompactionInvalid();
+	}
+}
+
+function readOutputItemIdentity(
+	item: ResponseOutputItem,
+): Omit<RetainedResponsesItem, "outputIndex" | "item" | "bytes"> {
+	if (typeof item !== "object" || item === null || typeof item.type !== "string") failCompactionInvalid();
+	const identity: Omit<RetainedResponsesItem, "outputIndex" | "item" | "bytes"> = { type: item.type };
+	if ("id" in item) {
+		if (typeof item.id !== "string" || item.id.length === 0) failCompactionInvalid();
+		identity.id = item.id;
+	}
+	if (item.type === "function_call") {
+		if (typeof item.call_id !== "string" || item.call_id.length === 0 || typeof item.name !== "string") {
+			failCompactionInvalid();
+		}
+		identity.callId = item.call_id;
+		identity.name = item.name;
+	}
+	if (item.type === "compaction") {
+		if (typeof item.id !== "string" || item.id.length === 0 || typeof item.encrypted_content !== "string") {
+			failCompactionInvalid();
+		}
+	}
+	return identity;
+}
+
+function validateRetainedItem(item: RetainedResponsesItem): void {
+	if (!Number.isSafeInteger(item.outputIndex) || item.outputIndex < 0) failCompactionInvalid();
+	const identity = readOutputItemIdentity(item.item);
+	if (
+		identity.type !== item.type ||
+		identity.id !== item.id ||
+		identity.callId !== item.callId ||
+		identity.name !== item.name ||
+		jsonByteLength(item.item) !== item.bytes
+	) {
+		failCompactionInvalid();
+	}
+	if (item.type === "compaction" && item.bytes > MAX_OPENAI_RESPONSES_COMPACTION_ITEM_BYTES) {
+		failCompactionOversized();
+	}
+}
+
+function retainedTurnMatchesMessage(turn: RetainedResponsesTurn, message: AssistantMessage): boolean {
+	return (
+		turn.provider === message.provider &&
+		turn.api === message.api &&
+		turn.model === message.model &&
+		message.api === "openai-responses"
+	);
+}
+
+function retainedTurnMatchesModel<TApi extends Api>(turn: RetainedResponsesTurn, model: Model<TApi>): boolean {
+	return turn.provider === model.provider && turn.api === model.api && turn.model === model.id;
+}
+
+function hasCompaction(turn: RetainedResponsesTurn): boolean {
+	return turn.items.some((entry) => entry.type === "compaction");
+}
+
+export function getOpenAIResponsesCompactionCount(message: AssistantMessage): number {
+	const turn = retainedResponsesTurns.get(message);
+	if (!turn) return 0;
+	if (!retainedTurnMatchesMessage(turn, message)) failCompactionInvalid();
+	for (const entry of turn.items) validateRetainedItem(entry);
+	return turn.items.filter((entry) => entry.type === "compaction").length;
+}
+
+function appendBoundedInput(input: ResponseInput, item: ResponseInputItem, retainedBytes: { value: number }): void {
+	retainedBytes.value += jsonByteLength(item);
+	if (retainedBytes.value > MAX_OPENAI_RESPONSES_RETAINED_WINDOW_BYTES) failCompactionOversized();
+	input.push(item);
+}
+
+function convertCompactedResponsesMessages<TApi extends Api>(
+	model: Model<TApi>,
+	context: Context,
+	options?: ConvertResponsesMessagesOptions,
+): ResponseInput | undefined {
+	let pivotMessageIndex = -1;
+	let pivotItemIndex = -1;
+
+	for (let messageIndex = 0; messageIndex < context.messages.length; messageIndex++) {
+		const message = context.messages[messageIndex];
+		if (message.role !== "assistant") continue;
+		const turn = retainedResponsesTurns.get(message);
+		if (!turn) continue;
+		if (!retainedTurnMatchesMessage(turn, message)) failCompactionInvalid();
+		for (const entry of turn.items) validateRetainedItem(entry);
+		if (!hasCompaction(turn)) continue;
+		if (!retainedTurnMatchesModel(turn, model)) failCompactionInvalid();
+		for (let itemIndex = 0; itemIndex < turn.items.length; itemIndex++) {
+			if (turn.items[itemIndex].type === "compaction") {
+				pivotMessageIndex = messageIndex;
+				pivotItemIndex = itemIndex;
+			}
+		}
+	}
+
+	if (pivotMessageIndex < 0) return undefined;
+
+	const input: ResponseInput = [];
+	const retainedBytes = { value: 0 };
+	const pendingCallIds: string[] = [];
+	const loadedToolNames = new Set<string>();
+
+	for (let messageIndex = pivotMessageIndex; messageIndex < context.messages.length; messageIndex++) {
+		const message = context.messages[messageIndex];
+		if (message.role === "assistant") {
+			const turn = retainedResponsesTurns.get(message);
+			if (!turn || !retainedTurnMatchesMessage(turn, message) || !retainedTurnMatchesModel(turn, model)) {
+				failCompactionInvalid();
+			}
+			const startIndex = messageIndex === pivotMessageIndex ? pivotItemIndex : 0;
+			for (let itemIndex = startIndex; itemIndex < turn.items.length; itemIndex++) {
+				const entry = turn.items[itemIndex];
+				validateRetainedItem(entry);
+				if (
+					entry.type !== "compaction" &&
+					entry.type !== "reasoning" &&
+					entry.type !== "message" &&
+					entry.type !== "function_call"
+				) {
+					failCompactionInvalid();
+				}
+				if (entry.type === "function_call") pendingCallIds.push(entry.callId as string);
+				appendBoundedInput(input, entry.item as ResponseInputItem, retainedBytes);
+			}
+		} else if (message.role === "toolResult") {
+			const [callId] = message.toolCallId.split("|");
+			if (!callId || pendingCallIds.shift() !== callId) failCompactionInvalid();
+			const converted = convertResponsesToolResult(model, message, options, loadedToolNames);
+			for (const item of converted) appendBoundedInput(input, item, retainedBytes);
+		} else {
+			if (pendingCallIds.length > 0) failCompactionInvalid();
+			if (typeof message.content === "string") {
+				appendBoundedInput(
+					input,
+					{ role: "user", content: [{ type: "input_text", text: sanitizeSurrogates(message.content) }] },
+					retainedBytes,
+				);
+			} else {
+				const content: ResponseInputContent[] = message.content.map(
+					(item): ResponseInputContent =>
+						item.type === "text"
+							? { type: "input_text", text: sanitizeSurrogates(item.text) }
+							: {
+									type: "input_image",
+									detail: "auto",
+									image_url: `data:${item.mimeType};base64,${item.data}`,
+								},
+				);
+				if (content.length > 0) appendBoundedInput(input, { role: "user", content }, retainedBytes);
+			}
+		}
+	}
+
+	if (pendingCallIds.length > 0 || input[0]?.type !== "compaction") failCompactionInvalid();
+	return input;
+}
+
 // =============================================================================
 // Message conversion
 // =============================================================================
@@ -99,6 +301,9 @@ export function convertResponsesMessages<TApi extends Api>(
 	allowedToolCallProviders: ReadonlySet<string>,
 	options?: ConvertResponsesMessagesOptions,
 ): ResponseInput {
+	const compactedInput = convertCompactedResponsesMessages(model, context, options);
+	if (compactedInput) return compactedInput;
+
 	const messages: ResponseInput = [];
 	const loadedToolNames = new Set<string>();
 
@@ -227,76 +432,73 @@ export function convertResponsesMessages<TApi extends Api>(
 			if (output.length === 0) continue;
 			messages.push(...output);
 		} else if (msg.role === "toolResult") {
-			const textResult = msg.content
-				.filter((c): c is TextContent => c.type === "text")
-				.map((c) => c.text)
-				.join("\n");
-			const hasImages = msg.content.some((c): c is ImageContent => c.type === "image");
-			const hasText = textResult.length > 0;
-			const [callId] = msg.toolCallId.split("|");
-
-			let output: string | ResponseFunctionCallOutputItemList;
-			if (hasImages && model.input.includes("image")) {
-				const contentParts: ResponseFunctionCallOutputItemList = [];
-
-				if (hasText) {
-					contentParts.push({
-						type: "input_text",
-						text: sanitizeSurrogates(textResult),
-					});
-				}
-
-				for (const block of msg.content) {
-					if (block.type === "image") {
-						contentParts.push({
-							type: "input_image",
-							detail: "auto",
-							image_url: `data:${block.mimeType};base64,${block.data}`,
-						});
-					}
-				}
-
-				output = contentParts;
-			} else {
-				output = sanitizeSurrogates(hasText ? textResult : hasImages ? "(see attached image)" : "(no tool output)");
-			}
-
-			messages.push({
-				type: "function_call_output",
-				call_id: callId,
-				output,
-			});
-
-			const deferredTools: Tool[] = [];
-			for (const name of msg.addedToolNames ?? []) {
-				const tool = options?.deferredTools?.get(name);
-				if (!tool || loadedToolNames.has(name)) continue;
-				loadedToolNames.add(name);
-				deferredTools.push(tool);
-			}
-			if (deferredTools.length > 0) {
-				const names = deferredTools.map((tool) => tool.name);
-				const searchCallId = `pi_tool_load_${shortHash(`${msg.toolCallId}:${names.join(",")}`)}`;
-				messages.push({
-					type: "tool_search_call",
-					call_id: searchCallId,
-					execution: "client",
-					status: "completed",
-					arguments: { query: names.join(" "), limit: names.length },
-				} satisfies ResponseInputItem);
-				messages.push({
-					type: "tool_search_output",
-					call_id: searchCallId,
-					execution: "client",
-					status: "completed",
-					tools: convertResponsesTools(deferredTools, { deferLoading: true }),
-				} satisfies ResponseToolSearchOutputItemParam);
-			}
+			messages.push(...convertResponsesToolResult(model, msg, options, loadedToolNames));
 		}
 		msgIndex++;
 	}
 
 	return messages;
+}
+
+function convertResponsesToolResult<TApi extends Api>(
+	model: Model<TApi>,
+	message: Extract<Context["messages"][number], { role: "toolResult" }>,
+	options: ConvertResponsesMessagesOptions | undefined,
+	loadedToolNames: Set<string>,
+): ResponseInputItem[] {
+	const textResult = message.content
+		.filter((content): content is TextContent => content.type === "text")
+		.map((content) => content.text)
+		.join("\n");
+	const hasImages = message.content.some((content): content is ImageContent => content.type === "image");
+	const hasText = textResult.length > 0;
+	const [callId] = message.toolCallId.split("|");
+
+	let output: string | ResponseFunctionCallOutputItemList;
+	if (hasImages && model.input.includes("image")) {
+		const contentParts: ResponseFunctionCallOutputItemList = [];
+		if (hasText) contentParts.push({ type: "input_text", text: sanitizeSurrogates(textResult) });
+		for (const block of message.content) {
+			if (block.type === "image") {
+				contentParts.push({
+					type: "input_image",
+					detail: "auto",
+					image_url: `data:${block.mimeType};base64,${block.data}`,
+				});
+			}
+		}
+		output = contentParts;
+	} else {
+		output = sanitizeSurrogates(hasText ? textResult : hasImages ? "(see attached image)" : "(no tool output)");
+	}
+
+	const converted: ResponseInputItem[] = [{ type: "function_call_output", call_id: callId, output }];
+	const deferredTools: Tool[] = [];
+	for (const name of message.addedToolNames ?? []) {
+		const tool = options?.deferredTools?.get(name);
+		if (!tool || loadedToolNames.has(name)) continue;
+		loadedToolNames.add(name);
+		deferredTools.push(tool);
+	}
+	if (deferredTools.length > 0) {
+		const names = deferredTools.map((tool) => tool.name);
+		const searchCallId = `pi_tool_load_${shortHash(`${message.toolCallId}:${names.join(",")}`)}`;
+		converted.push({
+			type: "tool_search_call",
+			call_id: searchCallId,
+			execution: "client",
+			status: "completed",
+			arguments: { query: names.join(" "), limit: names.length },
+		} satisfies ResponseInputItem);
+		converted.push({
+			type: "tool_search_output",
+			call_id: searchCallId,
+			execution: "client",
+			status: "completed",
+			tools: convertResponsesTools(deferredTools, { deferLoading: true }),
+		} satisfies ResponseToolSearchOutputItemParam);
+	}
+	return converted;
 }
 
 // =============================================================================
@@ -336,6 +538,11 @@ export async function processResponsesStream<TApi extends Api>(
 	options?: OpenAIResponsesStreamOptions,
 ): Promise<void> {
 	let sawTerminalResponseEvent = false;
+	const retainNativeOutput = model.api === "openai-responses";
+	const addedNativeItems = new Map<number, ReturnType<typeof readOutputItemIdentity>>();
+	const completedNativeItems = new Map<number, RetainedResponsesItem>();
+	let nextAddedOutputIndex = 0;
+	let nextDoneOutputIndex = 0;
 	const outputSlots = new Map<number, ResponsesOutputSlot>();
 	const reasoningBlocksById = new Map<string, ThinkingContent>();
 	const getSlot = <TType extends ResponsesOutputSlot["type"]>(
@@ -450,6 +657,17 @@ export async function processResponsesStream<TApi extends Api>(
 		if (event.type === "response.created") {
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {
+			if (retainNativeOutput) {
+				if (
+					!Number.isSafeInteger(event.output_index) ||
+					event.output_index !== nextAddedOutputIndex ||
+					addedNativeItems.has(event.output_index)
+				) {
+					failCompactionInvalid();
+				}
+				addedNativeItems.set(event.output_index, readOutputItemIdentity(event.item));
+				nextAddedOutputIndex++;
+			}
 			createSlot(event.output_index, event.item);
 		} else if (event.type === "response.reasoning_summary_text.delta") {
 			const slot = getSlot(event.output_index, "thinking");
@@ -532,6 +750,38 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
+			if (retainNativeOutput) {
+				if (
+					!Number.isSafeInteger(event.output_index) ||
+					event.output_index !== nextDoneOutputIndex ||
+					completedNativeItems.has(event.output_index)
+				) {
+					failCompactionInvalid();
+				}
+				const addedIdentity = addedNativeItems.get(event.output_index);
+				if (!addedIdentity) failCompactionInvalid();
+				const doneIdentity = readOutputItemIdentity(item);
+				if (
+					addedIdentity.type !== doneIdentity.type ||
+					addedIdentity.id !== doneIdentity.id ||
+					addedIdentity.callId !== doneIdentity.callId ||
+					addedIdentity.name !== doneIdentity.name
+				) {
+					failCompactionInvalid();
+				}
+				const bytes = jsonByteLength(item);
+				if (item.type === "compaction" && bytes > MAX_OPENAI_RESPONSES_COMPACTION_ITEM_BYTES) {
+					failCompactionOversized();
+				}
+				Object.freeze(item);
+				completedNativeItems.set(event.output_index, {
+					outputIndex: event.output_index,
+					item,
+					bytes,
+					...doneIdentity,
+				});
+				nextDoneOutputIndex++;
+			}
 			const slot = getOrCreateSlot(event.output_index, item);
 
 			if (item.type === "reasoning" && slot?.type === "thinking") {
@@ -588,6 +838,28 @@ export async function processResponsesStream<TApi extends Api>(
 	}
 	if (!sawTerminalResponseEvent) {
 		throw new Error("OpenAI Responses stream ended before a terminal response event");
+	}
+	if (retainNativeOutput) {
+		if (addedNativeItems.size !== completedNativeItems.size) failCompactionInvalid();
+		const items = [...completedNativeItems.values()];
+		let newestPivot = -1;
+		for (let index = 0; index < items.length; index++) {
+			if (items[index].type === "compaction") newestPivot = index;
+		}
+		if (newestPivot >= 0) {
+			let retainedBytes = 0;
+			for (const entry of items.slice(newestPivot)) {
+				validateRetainedItem(entry);
+				retainedBytes += entry.bytes;
+				if (retainedBytes > MAX_OPENAI_RESPONSES_RETAINED_WINDOW_BYTES) failCompactionOversized();
+			}
+		}
+		retainedResponsesTurns.set(output, {
+			provider: output.provider,
+			api: "openai-responses",
+			model: output.model,
+			items,
+		});
 	}
 }
 

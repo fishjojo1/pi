@@ -27,6 +27,7 @@ function createOutput(model: Model<"openai-responses">): AssistantMessage {
 async function* createFunctionCallEvents(argumentsJson: string): AsyncIterable<ResponseStreamEvent> {
 	yield {
 		type: "response.output_item.added",
+		output_index: 0,
 		item: {
 			type: "function_call",
 			id: "fc_test",
@@ -37,18 +38,22 @@ async function* createFunctionCallEvents(argumentsJson: string): AsyncIterable<R
 	} as ResponseStreamEvent;
 	yield {
 		type: "response.function_call_arguments.delta",
+		output_index: 0,
 		delta: '{"path":"README.md"',
 	} as ResponseStreamEvent;
 	yield {
 		type: "response.function_call_arguments.delta",
+		output_index: 0,
 		delta: ',"content":"updated"}',
 	} as ResponseStreamEvent;
 	yield {
 		type: "response.function_call_arguments.done",
+		output_index: 0,
 		arguments: argumentsJson,
 	} as ResponseStreamEvent;
 	yield {
 		type: "response.output_item.done",
+		output_index: 0,
 		item: {
 			type: "function_call",
 			id: "fc_test",
